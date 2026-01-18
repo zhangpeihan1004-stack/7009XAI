@@ -75,8 +75,7 @@ with st.spinner('System Initializing: Loading AI Models...'):
 
 class BlipGradCAMWrapper(torch.nn.Module):
     """
-    A robust wrapper to handle BLIP's variable output structure 
-    and ensure Grad-CAM receives the correct logits.
+    Ultra-Robust Wrapper: Handles missing logits by manually invoking the LM Head.
     """
     def __init__(self, model, input_ids, decoder_input_ids):
         super().__init__()
@@ -85,7 +84,6 @@ class BlipGradCAMWrapper(torch.nn.Module):
         self.decoder_input_ids = decoder_input_ids
         
     def forward(self, pixel_values):
-        # Expand dimensions to match batch size
         b = pixel_values.shape[0]
         input_ids_expanded = self.input_ids.expand(b, -1)
         decoder_input_ids_expanded = self.decoder_input_ids.expand(b, -1)
@@ -97,23 +95,28 @@ class BlipGradCAMWrapper(torch.nn.Module):
             decoder_input_ids=decoder_input_ids_expanded
         )
         
-        # --- ROBUST LOGIT EXTRACTION ---
-        # 1. Check for 'logits' (Standard)
+        # --- STRATEGY 1: Check for Direct Logits (Standard) ---
         if hasattr(outputs, 'logits'):
             return outputs.logits[:, 0, :]
             
-        # 2. Check for 'text_model_output' (Specific fix for your error)
-        elif hasattr(outputs, 'text_model_output') and hasattr(outputs.text_model_output, 'logits'):
-            return outputs.text_model_output.logits[:, 0, :]
-            
-        # 3. Check for 'text_outputs' (Older versions)
+        # --- STRATEGY 2: Check inside text_outputs (Some HF versions) ---
         elif hasattr(outputs, 'text_outputs') and hasattr(outputs.text_outputs, 'logits'):
             return outputs.text_outputs.logits[:, 0, :]
             
-        else:
-            # Panic mode: print attributes to help debug
-            raise AttributeError(f"Cannot find logits. Available keys: {dir(outputs)}")
+        elif hasattr(outputs, 'text_model_output') and hasattr(outputs.text_model_output, 'logits'):
+            return outputs.text_model_output.logits[:, 0, :]
 
+        # --- STRATEGY 3: Manual Calculation (The fix for your error) ---
+        # If we have 'last_hidden_state' but no logits, we compute them manually!
+        elif hasattr(outputs, 'last_hidden_state'):
+            # Access the Language Model Head (cls) from the text decoder
+            # This forces the projection from hidden_state -> vocab_size
+            logits = self.model.text_decoder.cls(outputs.last_hidden_state)
+            return logits[:, 0, :]
+            
+        else:
+            # Panic mode
+            raise AttributeError(f"Cannot find logits or hidden states. Keys: {outputs.keys()}")
 def reshape_transform(tensor, height=24, width=24):
     """
     Reshape Vision Transformer (ViT) patches back to 2D images.
