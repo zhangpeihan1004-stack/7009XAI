@@ -76,8 +76,7 @@ with st.spinner('System Initializing: Loading AI Models...'):
 
 class BlipGradCAMWrapper(torch.nn.Module):
     """
-    Wrapper to fix the 'missing pixel_values' error in Grad-CAM.
-    It binds the text inputs (input_ids) to the model so Grad-CAM only sees image inputs.
+    Robust Wrapper to fix 'missing pixel_values' AND 'no attribute logits' errors.
     """
     def __init__(self, model, input_ids, decoder_input_ids):
         super().__init__()
@@ -86,19 +85,36 @@ class BlipGradCAMWrapper(torch.nn.Module):
         self.decoder_input_ids = decoder_input_ids
         
     def forward(self, pixel_values):
-        # Expand inputs to match the batch size (Grad-CAM might create batches)
+        # 1. 扩充维度以匹配 batch size
         b = pixel_values.shape[0]
         input_ids_expanded = self.input_ids.expand(b, -1)
         decoder_input_ids_expanded = self.decoder_input_ids.expand(b, -1)
         
-        # Explicitly pass all arguments to the BLIP model
+        # 2. 调用模型
         outputs = self.model(
             input_ids=input_ids_expanded,
             pixel_values=pixel_values,
             decoder_input_ids=decoder_input_ids_expanded
         )
-        # Return logits for the first generated token
-        return outputs.logits[:, 0, :]
+        
+        # 3. 强壮的 Logits 获取逻辑 (关键修复点)
+        if hasattr(outputs, 'logits'):
+            # 情况 A: 标准输出，直接有 logits
+            return outputs.logits[:, 0, :]
+            
+        elif hasattr(outputs, 'text_outputs') and hasattr(outputs.text_outputs, 'logits'):
+            # 情况 B: Logits 藏在 text_outputs 里 (常见于某些 HF 版本)
+            return outputs.text_outputs.logits[:, 0, :]
+            
+        elif isinstance(outputs, tuple):
+            # 情况 C: 输出是 Tuple (logits, loss, ...)
+            # 通常第一个元素是 loss (如果提供了 labels) 或 logits
+            # 这里的 outputs[0] 可能是 logits
+            return outputs[0][:, 0, :]
+            
+        else:
+            # 情况 D: 最后的尝试 - 打印结构报错 (调试用)
+            raise AttributeError(f"Cannot find logits in model output type: {type(outputs)}")
 
 def reshape_transform(tensor, height=24, width=24):
     """
@@ -262,3 +278,4 @@ else:
            -> Computes gradients of the predicted answer w.r.t image features
            -> Reshapes 1D attention sequence to 2D heatmap
         """, language='python')
+
