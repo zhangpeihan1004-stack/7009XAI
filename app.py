@@ -7,231 +7,267 @@ from lime import lime_image
 from skimage.segmentation import mark_boundaries
 from transformers import BlipProcessor, BlipForQuestionAnswering
 import torch.nn.functional as F
+import io
 
-# --- 1. 页面基础配置 ---
+# --- 1. Page Configuration (Medical Theme) ---
 st.set_page_config(
-    page_title="VQA-RAD 医疗诊断系统",
+    page_title="VQA-RAD Clinical Decision Support",
     page_icon="🏥",
     layout="wide"
 )
 
-# 自定义 CSS 让界面更像医疗软件
+# Custom CSS for professional look
 st.markdown("""
 <style>
-    .reportview-container {
-        background: #f0f2f6;
-    }
     .main-header {
         font-size: 2.5rem;
-        color: #0e76a8;
+        color: #0056b3;
         text-align: center;
         margin-bottom: 1rem;
+        font-family: 'Helvetica Neue', sans-serif;
+        font-weight: bold;
     }
     .diagnosis-box {
-        background-color: #e8f4f8;
+        background-color: #f0f7ff;
         padding: 20px;
-        border-radius: 10px;
-        border-left: 5px solid #0e76a8;
+        border-radius: 8px;
+        border-left: 6px solid #0056b3;
         margin-bottom: 20px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .stButton>button {
+        background-color: #0056b3;
+        color: white;
+        width: 100%;
+        border-radius: 5px;
+        height: 50px;
+        font-size: 18px;
+    }
+    .stButton>button:hover {
+        background-color: #004494;
+        color: white;
     }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-header">🏥 智能医疗影像辅助诊断系统 (BLIP-XAI)</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">🏥 VQA-RAD Clinical Decision Support System</div>', unsafe_allow_html=True)
+st.markdown("<p style='text-align: center; color: gray;'>Powered by BLIP Model & LIME Explainability</p>", unsafe_allow_html=True)
 
-
-# --- 2. 加载模型 (核心部分) ---
+# --- 2. Load Model (Cached) ---
 @st.cache_resource
 def load_model():
     """
-    加载模型并缓存，避免每次刷新页面都重新下载
+    Load BLIP model and cache it to improve performance.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # 使用 Salesforce 的基础 BLIP 模型
+    # Using Salesforce BLIP Base VQA model
     processor = BlipProcessor.from_pretrained("Salesforce/blip-vqa-base")
     model = BlipForQuestionAnswering.from_pretrained("Salesforce/blip-vqa-base").to(device)
     return processor, model, device
 
-
-# 显示加载状态
-with st.spinner('正在初始化医疗 AI 引擎 (加载 BLIP 模型)...'):
+# Show spinner while loading
+with st.spinner('Initializing AI Engine (Loading Model weights)...'):
     processor, model, device = load_model()
 
-
-# --- 3. 核心预测与解释函数 ---
+# --- 3. Core Logic Functions (FIXED) ---
 
 def predict_answer(image, question):
     """
-    获取 BLIP 的文本回答
+    Standard Inference: Get text answer from BLIP
     """
     inputs = processor(image, question, return_tensors="pt").to(device)
     out = model.generate(**inputs)
     answer = processor.decode(out[0], skip_special_tokens=True)
     return answer
 
-
-def lime_predict_proba(images, question, target_label_idx=None):
+def lime_predict_proba(images, question, target_label_idx):
     """
-    适配 LIME 的预测函数。
-    LIME 需要输入 numpy 数组，输出概率。
-    这里我们计算模型生成特定答案的概率。
+    FIXED LIME Prediction Function:
+    Explicitly passes 'decoder_input_ids' to fix the generative model error.
     """
-    # LIME 传入的是 numpy 数组列表，转为 PIL
+    # 1. Convert numpy array (LIME input) to PIL list
     pil_images = [Image.fromarray(img.astype(np.uint8)) for img in images]
+    batch_size = len(pil_images)
+    
+    # 2. Tokenize inputs (Image + Question)
+    inputs = processor(
+        images=pil_images, 
+        text=[question] * batch_size, 
+        return_tensors="pt", 
+        padding=True
+    ).to(device)
 
-    # 构造 batch 输入
-    inputs = processor(images=pil_images, text=[question] * len(pil_images), return_tensors="pt", padding=True).to(
-        device)
+    # 3. CRITICAL FIX: Construct decoder_input_ids for the specific target token
+    # This tells the model: "Calculate the probability that the next word is [target_label_idx]"
+    decoder_input_ids = torch.tensor([target_label_idx] * batch_size).unsqueeze(1).to(device)
 
-    # 获取 logits
+    # 4. Forward pass
     with torch.no_grad():
-        outputs = model(**inputs)
-        # 获取词表中文本 logits
-        logits = outputs.text_outputs.logits[:, 0, :]  # 取第一个 token
+        outputs = model(**inputs, decoder_input_ids=decoder_input_ids)
+        
+        # 5. Extract probabilities
+        # Logits shape: (batch_size, seq_len, vocab_size) -> We take seq_len=0
+        logits = outputs.logits[:, 0, :] 
         probs = F.softmax(logits, dim=-1)
-
-    # 如果没有指定目标 label，就取当前最大概率的 label 作为目标
-    if target_label_idx is None:
-        target_label_idx = torch.argmax(probs[0]).item()
-
-    # LIME 需要返回 (batch_size, num_classes)，为了简化，我们只返回目标类的概率
-    # 构造一个伪概率：[目标类概率, 1-目标类概率]
+        
+    # 6. Extract probability of the specific target token
     target_probs = probs[:, target_label_idx].cpu().numpy()
+    
+    # 7. Return format required by LIME: [Prob of NOT target, Prob of Target]
     return np.stack([1 - target_probs, target_probs], axis=1)
 
+# --- 4. Sidebar UI ---
+st.sidebar.title("🩺 Control Panel")
 
-# --- 4. 侧边栏：控制区 ---
-st.sidebar.title("🩺 诊断控制台")
+st.sidebar.subheader("1. Patient Data")
+uploaded_file = st.sidebar.file_uploader("Upload Medical Image (X-Ray/CT)", type=["jpg", "png", "jpeg"])
 
-uploaded_file = st.sidebar.file_uploader("1. 上传影像 (X-Ray/CT)", type=["jpg", "png", "jpeg"])
-
-# 预设问题，方便演示
+st.sidebar.subheader("2. Diagnostic Query")
 question_options = [
     "Is there a fracture?",
     "Is the lung normal?",
     "What is the abnormality?",
     "Is the heart enlarged?",
-    "自定义问题..."
+    "Is there pleural effusion?",
+    "Custom Question..."
 ]
-selected_q = st.sidebar.selectbox("2. 选择诊断问题", question_options)
-if selected_q == "自定义问题...":
-    question = st.sidebar.text_input("请输入问题 (英文)", "Is there a fracture?")
+selected_q = st.sidebar.selectbox("Select Question", question_options)
+
+if selected_q == "Custom Question...":
+    question = st.sidebar.text_input("Enter clinical question (English):", "Is there a fracture?")
 else:
     question = selected_q
 
-# LIME 设置 (用于平衡速度和质量)
 st.sidebar.markdown("---")
-st.sidebar.subheader("🔬 XAI 设置")
-num_samples = st.sidebar.slider("LIME 采样数 (越高质量越好但越慢)", 50, 500, 100)
+st.sidebar.subheader("3. XAI Parameters")
+num_samples = st.sidebar.slider(
+    "LIME Perturbation Samples", 
+    min_value=30, 
+    max_value=300, 
+    value=60, 
+    help="Higher values = Better heatmap quality but slower speed. Keep low (50-100) for live demos."
+)
 
-# --- 5. 主界面逻辑 ---
+# --- 5. Main Layout ---
 
 if uploaded_file is not None:
-    # 布局：左图右文
+    # 2-Column Layout
     col1, col2 = st.columns([1, 1.2])
-
-    # 加载并显示原图
+    
+    # Load and Preprocess Image
     raw_image = Image.open(uploaded_file).convert('RGB')
-
+    
     with col1:
-        st.subheader("原始影像")
-        st.image(raw_image, use_column_width=True, caption="Uploaded Patient Scan")
+        st.subheader("Patient Scan")
+        st.image(raw_image, use_column_width=True, caption=f"Source: {uploaded_file.name}")
 
-    # 按钮触发分析
-    if st.sidebar.button("开始 AI 诊断与分析", type="primary"):
+    # Start Analysis Button
+    if st.sidebar.button("RUN DIAGNOSIS", type="primary"):
         with col2:
-            st.subheader("诊断报告")
-
-            # 步骤 A: 预测
-            with st.spinner('🤖 AI 正在阅片并生成诊断...'):
+            st.subheader("Diagnostic Report")
+            
+            # --- Step A: Get Text Prediction ---
+            with st.spinner('🤖 Analyzing image content...'):
                 diagnosis = predict_answer(raw_image, question)
-
-            # 显示漂亮的诊断框
+            
+            # Display Prediction
             st.markdown(f"""
             <div class="diagnosis-box">
-                <h4><b>Q:</b> {question}</h4>
-                <h3><b>A:</b> {diagnosis}</h3>
+                <p><b>Question:</b> {question}</p>
+                <h3><b>AI Finding:</b> {diagnosis.upper()}</h3>
             </div>
             """, unsafe_allow_html=True)
-
-            # 步骤 B: XAI 可视化 (LIME)
-            st.subheader("可解释性分析 (LIME)")
+            
+            # --- Step B: Generate Explanation (LIME) ---
+            st.subheader("Visual Explanation (LIME Heatmap)")
+            
+            # Progress tracking
             progress_bar = st.progress(0)
             status_text = st.empty()
-
+            
             try:
-                status_text.text("正在初始化 LIME 解释器...")
-                explainer = lime_image.LimeImageExplainer()
+                status_text.text("Preparing explainability engine...")
+                
+                # 1. Get the Token ID for the predicted answer
+                # We run generation again to extract the exact token ID
+                inputs_check = processor(raw_image, question, return_tensors="pt").to(device)
+                out_check = model.generate(**inputs_check)
+                
+                # BLIP typically outputs [BOS, token, ...] -> we want the token at index 1
+                if len(out_check[0]) > 1:
+                    predicted_token_id = out_check[0][1].item()
+                else:
+                    predicted_token_id = out_check[0][0].item() # Fallback
 
-                # 定义针对当前问题和图片的预测函数 wrapper
-                # 我们需要找到 answer 对应的 token ID
-                inputs = processor(raw_image, question, return_tensors="pt").to(device)
-                out = model.generate(**inputs)
-                predicted_token_id = out[0][1]  # 取生成的第一个有效 token (通常是 [CLS] 后的第一个)
-
-                # 包装函数
+                # 2. Define the wrapped prediction function for LIME
+                # This locks the question and target token, so LIME only varies the image
                 predict_fn_lime = lambda x: lime_predict_proba(x, question, target_label_idx=predicted_token_id)
 
-                status_text.text(f"正在生成扰动样本 (Samples: {num_samples})... 这可能需要一分钟")
-                progress_bar.progress(30)
-
-                # 核心 LIME 计算
+                # 3. Initialize Explainer
+                explainer = lime_image.LimeImageExplainer()
+                
+                status_text.text(f"Generating {num_samples} perturbations... (This may take a moment)")
+                progress_bar.progress(20)
+                
+                # 4. Run Explanation
                 explanation = explainer.explain_instance(
-                    np.array(raw_image),
-                    predict_fn_lime,
-                    top_labels=1,
-                    hide_color=0,
+                    np.array(raw_image), 
+                    predict_fn_lime, 
+                    top_labels=1, 
+                    hide_color=0, 
                     num_samples=num_samples
                 )
                 progress_bar.progress(80)
-
-                # 获取图像和掩膜
+                
+                # 5. Extract Image and Mask
                 temp, mask = explanation.get_image_and_mask(
-                    explanation.top_labels[0],
-                    positive_only=True,
-                    num_features=5,
+                    explanation.top_labels[0], 
+                    positive_only=True, 
+                    num_features=5, 
                     hide_rest=False
                 )
-
-                # 显示 LIME 结果
+                
+                # 6. Plotting
                 fig, ax = plt.subplots()
-                img_boundary = mark_boundaries(temp / 255.0 + 0.5, mask)  # 稍微调亮一点
+                img_boundary = mark_boundaries(temp / 255.0 + 0.5, mask)
                 ax.imshow(img_boundary)
                 ax.axis('off')
-                ax.set_title(f"LIME Visualization for '{diagnosis}'")
-
+                ax.set_title(f"Evidence for '{diagnosis}'")
+                
                 st.pyplot(fig)
                 progress_bar.progress(100)
-                status_text.text("✅ 分析完成")
-
-                st.info(
-                    f"**图解说明：** 黄色/高亮边缘区域表示 AI 在判定 '{diagnosis}' 时重点关注的图像特征 (Superpixels)。")
-
-                # 生成可下载报告
+                status_text.text("✅ Analysis Complete")
+                
+                # Explanation text
+                st.info(f"**Interpretation:** The highlighted areas indicate the visual features that convinced the AI model to predict '{diagnosis}'.")
+                
+                # Report Download
                 report_content = f"""
-                === VQA-RAD DIAGNOSTIC REPORT ===
+                === VQA-RAD CLINICAL REPORT ===
                 Image: {uploaded_file.name}
-                Clinical Question: {question}
+                Query: {question}
                 AI Diagnosis: {diagnosis}
-                XAI Method: LIME (Local Interpretable Model-agnostic Explanations)
-                Confidence Areas: Identified in the attached visualization.
-                =================================
+                Confidence Validation: LIME Heatmap Generated
+                ===============================
                 """
-                st.download_button("📥 下载完整诊断报告", report_content, "diagnosis_report.txt")
-
+                st.download_button("📥 Download Report (.txt)", report_content, "clinical_report.txt")
+                
             except Exception as e:
-                st.error(f"XAI 生成过程中发生错误: {str(e)}")
-                st.write("建议：尝试减少 LIME 采样数或检查显存。")
+                st.error(f"XAI Error: {str(e)}")
+                st.warning("Try reducing the 'Perturbation Samples' in the sidebar if memory is an issue.")
 
 else:
-    # 欢迎页状态
-    st.info("👈 请在左侧侧边栏上传一张医学影像以开始演示。")
-
-    # 演示用的伪代码展示 (可选)
-    with st.expander("查看 Dashboard 原理 (代码片段)"):
+    # Empty State - Instructional
+    st.info("👈 Please upload an X-Ray or CT scan in the sidebar to begin analysis.")
+    
+    # Optional: Architecture Demo for Pre
+    with st.expander("Show System Architecture (For Presentation)"):
         st.code("""
-        # 核心逻辑
-        diagnosis = model.generate(image, question)
-        explanation = lime.explain_instance(image, predict_fn)
-        st.pyplot(explanation.show())
+        # System Workflow
+        1. Input: Image + Clinical Question
+        2. Model: Salesforce BLIP (Bootstrapping Language-Image Pre-training)
+        3. Interpretation: LIME (Local Interpretable Model-agnostic Explanations)
+           -> Generates perturbations
+           -> Calculates probability of target token
+           -> Visualizes superpixels
         """, language='python')
