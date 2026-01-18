@@ -82,14 +82,15 @@ def predict_answer(image, question):
 
 def lime_predict_proba(images, question, target_label_idx):
     """
-    FIXED LIME Prediction Function:
-    Explicitly passes 'decoder_input_ids' to fix the generative model error.
+    FIXED LIME Prediction Function (Robust Version):
+    Uses 'model.generate' with 'output_scores=True' to get probabilities.
+    This bypasses the 'BlipTextVisionModelOutput' error completely.
     """
     # 1. Convert numpy array (LIME input) to PIL list
     pil_images = [Image.fromarray(img.astype(np.uint8)) for img in images]
     batch_size = len(pil_images)
     
-    # 2. Tokenize inputs (Image + Question)
+    # 2. Tokenize inputs
     inputs = processor(
         images=pil_images, 
         text=[question] * batch_size, 
@@ -97,23 +98,26 @@ def lime_predict_proba(images, question, target_label_idx):
         padding=True
     ).to(device)
 
-    # 3. CRITICAL FIX: Construct decoder_input_ids for the specific target token
-    # This tells the model: "Calculate the probability that the next word is [target_label_idx]"
-    decoder_input_ids = torch.tensor([target_label_idx] * batch_size).unsqueeze(1).to(device)
-
-    # 4. Forward pass
+    # 3. CRITICAL FIX: Use generate() to get scores directly
+    # This works on ALL versions of transformers and avoids the "no attribute logits" error
     with torch.no_grad():
-        outputs = model(**inputs, decoder_input_ids=decoder_input_ids)
-        
-        # 5. Extract probabilities
-        # Logits shape: (batch_size, seq_len, vocab_size) -> We take seq_len=0
-        logits = outputs.logits[:, 0, :] 
-        probs = F.softmax(logits, dim=-1)
-        
-    # 6. Extract probability of the specific target token
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=1,             # We only need the first token probability
+            output_scores=True,           # Request logits/scores
+            return_dict_in_generate=True  # Return object with 'scores' attribute
+        )
+    
+    # 4. Extract logits for the first generated token
+    # outputs.scores is a tuple (one per step), we take the first step [0]
+    # shape: (batch_size, vocab_size)
+    logits = outputs.scores[0]
+    probs = F.softmax(logits, dim=-1)
+    
+    # 5. Extract probability of the specific target token
     target_probs = probs[:, target_label_idx].cpu().numpy()
     
-    # 7. Return format required by LIME: [Prob of NOT target, Prob of Target]
+    # 6. Return format required by LIME: [Prob of NOT target, Prob of Target]
     return np.stack([1 - target_probs, target_probs], axis=1)
 
 # --- 4. Sidebar UI ---
