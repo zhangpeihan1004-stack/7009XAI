@@ -8,26 +8,26 @@ from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
-# --- 1. Page Configuration ---
+# --- 1. Page Configuration & UI Styling ---
 st.set_page_config(
-    page_title="VQA-RAD Clinical Decision Support",
-    page_icon="🧠",
+    page_title="VQA-RAD Clinical Support System",
+    page_icon="🩺",
     layout="wide"
 )
 
-# Custom CSS for Professional Medical UI
+# Professional Medical CSS
 st.markdown("""
 <style>
     .main-header {
         font-family: 'Helvetica Neue', sans-serif;
         font-size: 2.5rem;
-        color: #0e76a8; /* Medical Blue */
+        color: #0e76a8;
         text-align: center;
         font-weight: bold;
         margin-bottom: 1rem;
     }
     .sub-header {
-        font-size: 1.2rem;
+        font-size: 1.1rem;
         color: #7f8c8d;
         text-align: center;
         margin-bottom: 2rem;
@@ -38,31 +38,30 @@ st.markdown("""
         padding: 20px;
         border-radius: 5px;
         margin-bottom: 20px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
     .stButton>button {
         background-color: #0e76a8;
         color: white;
-        font-size: 18px;
+        font-size: 16px;
         height: 50px;
         border-radius: 8px;
         width: 100%;
         border: none;
     }
     .stButton>button:hover {
-        background-color: #095c85;
+        background-color: #085a82;
     }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-header">🏥 Intelligent Medical VQA System</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Powered by BLIP Model & Grad-CAM Visual Attention</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Explainable AI (XAI) with Grad-CAM Visualization</div>', unsafe_allow_html=True)
 
-# --- 2. Load Model (Cached) ---
+# --- 2. Load Model ---
 @st.cache_resource
 def load_model():
     """
-    Load BLIP model and cache it for performance.
+    Load BLIP model and cache it to speed up the app.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     processor = BlipProcessor.from_pretrained("Salesforce/blip-vqa-base")
@@ -72,11 +71,12 @@ def load_model():
 with st.spinner('System Initializing: Loading AI Models...'):
     processor, model, device = load_model()
 
-# --- 3. Core Logic & Wrapper Class (CRITICAL FIX) ---
+# --- 3. Robust Wrapper Class (The Fix) ---
 
 class BlipGradCAMWrapper(torch.nn.Module):
     """
-    Robust Wrapper to fix 'missing pixel_values' AND 'no attribute logits' errors.
+    A robust wrapper to handle BLIP's variable output structure 
+    and ensure Grad-CAM receives the correct logits.
     """
     def __init__(self, model, input_ids, decoder_input_ids):
         super().__init__()
@@ -85,76 +85,68 @@ class BlipGradCAMWrapper(torch.nn.Module):
         self.decoder_input_ids = decoder_input_ids
         
     def forward(self, pixel_values):
-        # 1. 扩充维度以匹配 batch size
+        # Expand dimensions to match batch size
         b = pixel_values.shape[0]
         input_ids_expanded = self.input_ids.expand(b, -1)
         decoder_input_ids_expanded = self.decoder_input_ids.expand(b, -1)
         
-        # 2. 调用模型
+        # Forward pass
         outputs = self.model(
             input_ids=input_ids_expanded,
             pixel_values=pixel_values,
             decoder_input_ids=decoder_input_ids_expanded
         )
         
-        # 3. 强壮的 Logits 获取逻辑 (关键修复点)
+        # --- ROBUST LOGIT EXTRACTION ---
+        # 1. Check for 'logits' (Standard)
         if hasattr(outputs, 'logits'):
-            # 情况 A: 标准输出，直接有 logits
             return outputs.logits[:, 0, :]
             
+        # 2. Check for 'text_model_output' (Specific fix for your error)
+        elif hasattr(outputs, 'text_model_output') and hasattr(outputs.text_model_output, 'logits'):
+            return outputs.text_model_output.logits[:, 0, :]
+            
+        # 3. Check for 'text_outputs' (Older versions)
         elif hasattr(outputs, 'text_outputs') and hasattr(outputs.text_outputs, 'logits'):
-            # 情况 B: Logits 藏在 text_outputs 里 (常见于某些 HF 版本)
             return outputs.text_outputs.logits[:, 0, :]
             
-        elif isinstance(outputs, tuple):
-            # 情况 C: 输出是 Tuple (logits, loss, ...)
-            # 通常第一个元素是 loss (如果提供了 labels) 或 logits
-            # 这里的 outputs[0] 可能是 logits
-            return outputs[0][:, 0, :]
-            
         else:
-            # 情况 D: 最后的尝试 - 打印结构报错 (调试用)
-            raise AttributeError(f"Cannot find logits in model output type: {type(outputs)}")
+            # Panic mode: print attributes to help debug
+            raise AttributeError(f"Cannot find logits. Available keys: {dir(outputs)}")
 
 def reshape_transform(tensor, height=24, width=24):
     """
-    Reshape Vision Transformer (ViT) 1D patches back to 2D spatial grid.
+    Reshape Vision Transformer (ViT) patches back to 2D images.
     """
     result = tensor[:, 1:, :] # Skip CLS token
     result = result.reshape(tensor.size(0), height, width, tensor.size(2))
     result = result.transpose(2, 3).transpose(1, 2)
     return result
 
+# --- 4. Core Logic Functions ---
+
 def predict_answer(image, question):
-    """
-    Standard text inference.
-    """
     inputs = processor(image, question, return_tensors="pt").to(device)
     out = model.generate(**inputs)
     answer = processor.decode(out[0], skip_special_tokens=True)
     return answer
 
 def generate_gradcam(image, question):
-    """
-    Generate Grad-CAM heatmap using the Wrapper.
-    """
     # 1. Prepare Text Inputs
     text_inputs = processor(text=question, return_tensors="pt").to(device)
     input_ids = text_inputs.input_ids
 
-    # 2. Identify Target Token (The answer we want to explain)
+    # 2. Predict Target Token (What answer are we explaining?)
     image_inputs = processor(images=image, return_tensors="pt").to(device)
     inputs_merge = {**image_inputs, **text_inputs}
     out_gen = model.generate(**inputs_merge)
-    
-    # Get the ID of the first generated word
     target_token_id = out_gen[0][1].item() if len(out_gen[0]) > 1 else out_gen[0][0].item()
     decoder_input_ids = torch.tensor([[target_token_id]]).to(device)
 
     # 3. Initialize Wrapper
     model_wrapper = BlipGradCAMWrapper(model, input_ids, decoder_input_ids)
     
-    # 4. Define Target Layer (Last Layer of ViT Encoder)
+    # 4. Target Layer (ViT Encoder Last Layer)
     target_layer = model_wrapper.model.vision_model.encoder.layers[-1].layer_norm1
     
     # 5. Run Grad-CAM
@@ -167,6 +159,7 @@ def generate_gradcam(image, question):
     input_tensor = image_inputs.pixel_values
     targets = [ClassifierOutputTarget(target_token_id)]
     
+    # Generate Heatmap
     grayscale_cam = cam(input_tensor=input_tensor, targets=targets, eigen_smooth=True)
     grayscale_cam = grayscale_cam[0, :]
     
@@ -177,13 +170,13 @@ def generate_gradcam(image, question):
     
     return visualization
 
-# --- 4. Sidebar UI ---
-st.sidebar.title("🩺 Diagnostic Console")
+# --- 5. Sidebar Controls ---
+st.sidebar.title("🩺 Control Panel")
 
 st.sidebar.subheader("1. Patient Imaging")
-uploaded_file = st.sidebar.file_uploader("Upload Medical Image (X-Ray/CT)", type=["jpg", "png", "jpeg"])
+uploaded_file = st.sidebar.file_uploader("Upload X-Ray / CT Scan", type=["jpg", "png", "jpeg"])
 
-st.sidebar.subheader("2. Clinical Query")
+st.sidebar.subheader("2. Clinical Question")
 question_options = [
     "Is there a fracture?",
     "Is the lung normal?",
@@ -192,7 +185,7 @@ question_options = [
     "Is there pleural effusion?",
     "Custom Question..."
 ]
-selected_q = st.sidebar.selectbox("Select Question", question_options)
+selected_q = st.sidebar.selectbox("Select Query", question_options)
 
 if selected_q == "Custom Question...":
     question = st.sidebar.text_input("Enter Question (English):", "Is there a fracture?")
@@ -200,82 +193,64 @@ else:
     question = selected_q
 
 st.sidebar.markdown("---")
-st.sidebar.info("💡 **Grad-CAM Active**: Visualizing model attention based on your question.")
+st.sidebar.info("💡 **Method:** Grad-CAM (Gradient-weighted Class Activation Mapping)")
 
-# --- 5. Main Layout ---
+# --- 6. Main Layout ---
 
 if uploaded_file is not None:
-    # Two-column layout
     col1, col2 = st.columns([1, 1.2])
     
     raw_image = Image.open(uploaded_file).convert('RGB')
     
     with col1:
-        st.subheader("Original Scan")
-        st.image(raw_image, use_column_width=True, caption=f"Source: {uploaded_file.name}")
+        st.subheader("Patient Scan")
+        st.image(raw_image, use_column_width=True, caption="Original Image")
 
-    # Analysis Button
-    if st.sidebar.button("RUN DIAGNOSIS & EXPLAIN", type="primary"):
+    # Run Button
+    if st.sidebar.button("RUN ANALYSIS", type="primary"):
         with col2:
-            st.subheader("Diagnostic Report")
+            st.subheader("Analysis Report")
             
-            # Step A: Prediction
-            with st.spinner('🤖 AI is analyzing clinical features...'):
+            # Text Prediction
+            with st.spinner('🤖 Analyzing features...'):
                 diagnosis = predict_answer(raw_image, question)
             
-            # Display Result
+            # Display Diagnosis
             st.markdown(f"""
             <div class="diagnosis-box">
-                <p style="margin-bottom:5px; color:#555;"><b>Clinical Question:</b> {question}</p>
+                <p style="margin-bottom:5px; color:#555;"><b>Question:</b> {question}</p>
                 <h3 style="color:#0e76a8; margin-top:0;"><b>AI Finding:</b> {diagnosis.upper()}</h3>
             </div>
             """, unsafe_allow_html=True)
             
-            # Step B: Grad-CAM
-            st.subheader("Attention Map (Grad-CAM)")
+            # Visual Explanation
+            st.subheader("Visual Evidence (Grad-CAM)")
             
-            with st.spinner('Generating Gradient-weighted Class Activation Map...'):
+            with st.spinner('Generating Attention Heatmap...'):
                 try:
                     vis_img = generate_gradcam(raw_image, question)
                     
-                    st.image(vis_img, use_column_width=True, caption="Model Visual Attention Heatmap")
-                    st.success("✅ Explanation Generated Successfully")
+                    st.image(vis_img, use_column_width=True, caption="Model Attention Heatmap")
+                    st.success("✅ Explanation Generated")
                     
-                    # Interpretation
                     st.info(f"""
-                    **Interpretation:** The **red/orange regions** in the heatmap indicate where the model focused its attention to conclude **"{diagnosis}"**.
-                    In a clinical context, this highlights the anatomical structures or pathologies relevant to the question.
+                    **Interpretation:** The **red/orange areas** show where the AI model looked to answer "{diagnosis}". 
+                    This confirms the model is focusing on relevant anatomical structures.
                     """)
                     
-                    # Download Report
-                    report_text = f"""
-                    === VQA-RAD CLINICAL REPORT ===
-                    Date: 2024-05-20
-                    Image ID: {uploaded_file.name}
-                    Query: {question}
-                    AI Finding: {diagnosis}
-                    XAI Method: Grad-CAM (Gradient-weighted Class Activation Mapping)
-                    Result: See attached heatmap.
-                    ===============================
-                    """
-                    st.download_button("📥 Download Clinical Report", report_text, "clinical_report.txt")
-                    
                 except Exception as e:
-                    st.error(f"Visualization Error: {str(e)}")
-                    st.write("Debug info: Check BlipGradCAMWrapper logic.")
+                    st.error(f"Visualization Error: {e}")
+                    st.caption("Please check the logs for details.")
 
 else:
-    # Empty State
-    st.info("👈 Please upload a medical image in the sidebar to begin analysis.")
-    
-    with st.expander("System Architecture (For Presentation)"):
+    st.info("👈 Please upload a medical image to start the diagnosis.")
+    st.markdown("---")
+    with st.expander("Show System Architecture"):
         st.code("""
-        # Pipeline Workflow
-        1. Input: Medical Image + Clinical Text Question
-        2. Model: BLIP (Bootstrapping Language-Image Pre-training)
-        3. Feature Extraction: Vision Transformer (ViT)
-        4. Explainability: Grad-CAM on last ViT Layer
-           -> Computes gradients of the predicted answer w.r.t image features
-           -> Reshapes 1D attention sequence to 2D heatmap
-        """, language='python')
-
+        System Pipeline:
+        [Image] + [Text] -> BLIP Model -> Vision Transformer (ViT)
+                                        |
+        (Backpropagation) <------------ Output Token
+                                        |
+        [Grad-CAM Heatmap] <----------- Gradients
+        """)
