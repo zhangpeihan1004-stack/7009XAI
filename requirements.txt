@@ -1,0 +1,9 @@
+streamlit
+torch
+transformers
+pillow
+numpy
+matplotlib
+scikit-image
+lime
+tqdm
