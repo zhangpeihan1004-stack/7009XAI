@@ -7,3 +7,5 @@ matplotlib
 scikit-image
 lime
 tqdm
+grad-cam
+opencv-python
